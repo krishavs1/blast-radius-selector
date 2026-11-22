@@ -319,6 +319,15 @@ class Maps:
                     b |= v
         return b
 
+    def dir_readers(self, rel):
+        """Tests that open some file in the same directory as rel."""
+        d = os.path.dirname(rel) + "/"
+        b = 0
+        for f, v in self.opens.items():
+            if f.startswith(d) and "/" not in f[len(d):]:
+                b |= v
+        return b
+
     def dir_touch(self, rel):
         d = os.path.dirname(rel) + "/"
         b = 0
@@ -495,14 +504,36 @@ def _jump_targets(co):
 
 
 def _instr_offsets(co):
-    """For each instruction (EXTENDED_ARG prefixes folded in): the offsets it occupies."""
+    """For each instruction (EXTENDED_ARG prefixes folded in): the offsets it occupies.
+
+    An instruction that begins a line (or can be jumped to) is reported by the
+    interpreter as a line event rather than an instruction event, so the
+    instruction map cannot vouch for it: such instructions get an empty list
+    and are covered through their line.
+    """
+    ins_all = list(dis.get_instructions(co))
+    targets = {i.argval for i in ins_all if (i.opcode in dis.hasjrel or i.opcode in dis.hasjabs or "JUMP" in i.opname)}
+    for e in dis._parse_exception_table(co) if hasattr(dis, "_parse_exception_table") else ():
+        targets.add(e.target)
     out = []
     pend = []
-    for ins in dis.get_instructions(co):
+    prev_line = None
+    first = True
+    for ins in ins_all:
+        pos = ins.positions
+        line = pos.lineno if pos is not None else None
+        starts = first or line != prev_line or ins.offset in targets or ins.opname in ("RESUME", "FOR_ITER", "END_FOR")
+        prev_line = line
+        first = False
         if ins.opname == "EXTENDED_ARG":
+            if starts:
+                pend.append(None)
             pend.append(ins.offset)
             continue
-        out.append(pend + [ins.offset])
+        if starts or None in pend:
+            out.append([])
+        else:
+            out.append(pend + [ins.offset])
         pend = []
     return out
 
@@ -551,7 +582,10 @@ def changed_old_lines(o, n, offsets=None):
             hit.append(i)
     if offsets is not None and out:
         for i in hit:
-            offsets.update(oo[i])
+            if oo[i]:
+                offsets.update(oo[i])
+            else:
+                offsets.add(("line", lo[i]))  # only its line can say who runs it
     return out or None
 
 
@@ -793,8 +827,11 @@ def py_change(maps, rel, old_src, new_src):
             c = maps.cover(rel, lines)
             if offs and INSTR is not None and not is_test_file:
                 # finer: the tests that execute the changed instructions themselves
-                ci = INSTR.cover((rel, o.co_qualname, o.co_firstlineno), offs)
+                # (instructions that begin a line are known only by their line)
+                by_line = {x[1] for x in offs if isinstance(x, tuple)}
+                ci = INSTR.cover((rel, o.co_qualname, o.co_firstlineno), [x for x in offs if not isinstance(x, tuple)])
                 if ci is not None:
+                    ci |= maps.cover(rel, by_line)
                     ch.notes.append("instr %d of %d" % ((ci & c).bit_count(), c.bit_count()))
                     c &= ci
             ch.lines |= set(lines)
@@ -830,7 +867,7 @@ class Plan:
     __slots__ = (
         "cid", "cand", "include", "overlay", "notes", "fails", "done",
         "fresh", "tests_changed", "swaps", "all_if_fresh", "changed", "readers", "probe",
-        "src_read", "code_files", "lines_all",
+        "src_read", "code_files", "lines_all", "test_code",
     )
 
     def __init__(self, cid):
@@ -851,6 +888,7 @@ class Plan:
         self.src_read = False  # a changed sqlglot source file is read as text by tests
         self.code_files = set()  # changed sqlglot .py files whose compiled code differs
         self.lines_all = {}  # rel -> changed function lines, also for plans that need a fresh import
+        self.test_code = False  # a test module itself changed
 
 
 def read_pristine(rel):
@@ -897,11 +935,13 @@ def analyze(maps, cid, text):
             plan.overlay[fc.old] = None
             plan.overlay[fc.new] = new_text
             plan.notes.append("%s: renamed" % rel)
-            plan.cand |= maps.module_touch(fc.old) | maps.dir_touch(fc.old) | maps.dir_touch(fc.new)
+            plan.cand |= maps.module_touch(fc.old) | maps.dir_readers(fc.old) | maps.dir_readers(fc.new)
             if fc.old.endswith(".py"):
                 plan.cand = maps.all
-            plan.fresh = True
+            if "sqlglot" in (fc.old.split("/")[0], fc.new.split("/")[0]):
+                plan.fresh = True
             plan.tests_changed = True
+            plan.readers |= plan.cand
             continue
         if fc.old is None:
             new_text = apply_hunks("", fc.hunks)
@@ -910,12 +950,17 @@ def analyze(maps, cid, text):
                 continue
             plan.overlay[rel] = new_text
             plan.notes.append("%s: new file" % rel)
-            if os.path.exists(os.path.join(PRISTINE, rel)):
+            base = os.path.basename(rel)
+            if os.path.exists(os.path.join(PRISTINE, rel)) or base in ("conftest.py", "__init__.py", "sitecustomize.py"):
                 plan.cand |= maps.all
             elif in_tree:
-                plan.cand |= maps.dir_touch(rel)
-            plan.fresh = True
-            plan.tests_changed = True
+                # nothing imports a file that did not exist; tests that scan its
+                # directory (they open its neighbours) may still pick it up
+                plan.cand |= maps.dir_readers(rel)
+            if top == "sqlglot":
+                plan.fresh = True
+            elif top == "tests":
+                plan.tests_changed = True
             continue
         old_text = read_pristine(rel)
         if old_text is None:
@@ -925,11 +970,14 @@ def analyze(maps, cid, text):
         if fc.new is None:
             plan.overlay[rel] = None
             plan.notes.append("%s: deleted" % rel)
-            plan.cand |= maps.module_touch(rel) | maps.dir_touch(rel)
+            plan.cand |= maps.module_touch(rel) | maps.dir_readers(rel)
             if rel.endswith(".py"):
                 plan.cand = maps.all
-            plan.fresh = True
-            plan.tests_changed = True
+            if top == "sqlglot":
+                plan.fresh = True
+            elif top == "tests":
+                plan.tests_changed = True
+            plan.readers |= plan.cand
             continue
         new_text = apply_hunks(old_text, fc.hunks)
         if new_text is None:
@@ -949,6 +997,8 @@ def analyze(maps, cid, text):
         plan.overlay[rel] = new_text
         if top == "tests":
             plan.tests_changed = True
+            if rel.endswith(".py"):
+                plan.test_code = True
         if rel.endswith(".py"):
             ch = py_change(maps, rel, old_text, new_text)
             plan.notes.append("%s: %s" % (rel, "; ".join(ch.notes)))
@@ -1334,7 +1384,15 @@ def _mention_uses(self, rel, line, name, line_cover):
         if not first <= line <= last:
             continue
         offs = []
+        try:
+            groups = _instr_offsets(co)
+        except Exception:
+            return line_cover
+        k = -1
         for ins in dis.get_instructions(co):
+            if ins.opname == "EXTENDED_ARG":
+                continue
+            k += 1
             pos = ins.positions
             if pos is None or pos.lineno != line:
                 continue
@@ -1342,7 +1400,9 @@ def _mention_uses(self, rel, line, name, line_cover):
                 continue
             av = ins.argval
             if av == name or (isinstance(av, tuple) and ins.opcode not in dis.hasconst and name in av):
-                offs.append(ins.offset)
+                if not groups[k]:
+                    return line_cover  # begins the line: only the line map knows
+                offs.extend(groups[k])
         if offs:
             c = INSTR.cover((rel, co.co_qualname, co.co_firstlineno), offs)
             if c is None:
@@ -1703,7 +1763,7 @@ def child_main(maps, plan, root, wfd, secs, forced):
     gc.set_threshold(GC_THRESHOLD, 50, 100)
 
     def note(msg):
-        out.write("N %s\n" % msg.replace("\n", " ")[:600])
+        out.write("N %s\n" % msg.replace("\n", " ")[:1500])
 
     cand = plan.cand
     fresh = plan.fresh
@@ -1722,6 +1782,10 @@ def child_main(maps, plan, root, wfd, secs, forced):
                 and forced is None
                 and not FULL
                 and len({r for r, _, _ in plan.swaps}) == 1
+                and len(plan.code_files) == 1
+                and not plan.tests_changed
+                and not plan.src_read
+                and not plan.readers
                 and frozenset(plan.probe[2:4]) in _PROBE_PAIRS
             ):
                 prel, pswaps, old_op, new_op = plan.probe
@@ -1782,7 +1846,7 @@ def child_main(maps, plan, root, wfd, secs, forced):
                     changed_mods = None
                     break
                 changed_mods.add(mname)
-        if changed_mods and Zygote.deps and not PURGE_ALL and all(m in Zygote.deps for m in changed_mods):
+        if changed_mods and Zygote.deps and not PURGE_ALL and not FULL and all(m in Zygote.deps for m in changed_mods):
             only = reverse_closure(Zygote.deps, changed_mods)
             if len(only) > 0.5 * len(Zygote.modules):
                 only = None
@@ -1791,7 +1855,13 @@ def child_main(maps, plan, root, wfd, secs, forced):
             names = Zygote.modules
         else:
             for name in only:
-                sys.modules.pop(name, None)
+                gone = sys.modules.pop(name, None)
+                # `from package import module` looks at the package's attribute first:
+                # it must not find the module that was just dropped
+                parent, _, child = name.rpartition(".")
+                pm = sys.modules.get(parent)
+                if pm is not None and gone is not None and pm.__dict__.get(child) is gone:
+                    del pm.__dict__[child]
             importlib.invalidate_caches()
             pkg = sys.modules.get("sqlglot.dialects")
             if pkg is not None:
@@ -1811,7 +1881,7 @@ def child_main(maps, plan, root, wfd, secs, forced):
                             pass
             names = [n for n in Zygote.modules if n in only]
             note("partial re-import of %d modules" % len(names))
-        signal.setitimer(signal.ITIMER_REAL, 40)
+        signal.setitimer(signal.ITIMER_REAL, 20)
         if only is None:
             ok, failed = import_all_sqlglot(names)
         else:
@@ -1843,8 +1913,9 @@ def child_main(maps, plan, root, wfd, secs, forced):
             preset_fail = maps.imports.get("sqlglot", 0) & maps.known
             cand = maps.known & ~preset_fail
         elif failed:
-            # Some module no longer imports. Which tests ask for it depends on what is
-            # loaded lazily in a real run, which the maps do not record: select them all.
+            # Some module no longer imports. Which tests end up asking for it depends on
+            # what a real run loads lazily and in which process; the maps cannot settle
+            # that reliably, so every test is selected.
             note("modules fail to import: %s" % ",".join(failed[:8]))
             for i in bits(maps.known):
                 out.write("I %d\n" % i)
@@ -2011,7 +2082,9 @@ def child_main(maps, plan, root, wfd, secs, forced):
                     self.shouldStop = True  # the change makes tests hang: stop paying for it
             self._mark(test)
             if DEBUG:
-                note("ERR %s %r" % (test, err[1]))
+                import traceback
+
+                note("ERR %s %r cause=%r tb=%s" % (test, err[1], getattr(err[1], "__cause__", None), " | ".join(traceback.format_exception(getattr(err[1], "__cause__", None) or err[1])[-6:])))
 
         def addFailure(self, test, err):
             self._mark(test)
@@ -2206,7 +2279,8 @@ def child_main(maps, plan, root, wfd, secs, forced):
             out.write("I %d\n" % i)
             selected.add(i)
             continue
-        is_reader = (plan.readers >> i) & 1
+        # (a test whose own code or data changed is not vouched for by other tests passing)
+        is_reader = (plan.readers >> i) & 1 or plan.test_code
         frac = failed / max(1, ran)
         if failed == 0:
             if ran >= GIANT_MIN_EVIDENCE and run_cost >= SKIP_MIN_COST and not is_reader:
@@ -2218,11 +2292,21 @@ def child_main(maps, plan, root, wfd, secs, forced):
             run_list([i])
             selected.update(failed_idx[before:])
             continue
-        if failed <= 3 and frac <= 0.2 and ran >= GIANT_MIN_EVIDENCE and run_cost >= SKIP_HUGE_COST and not is_reader:
-            # a change that only a handful of narrow tests notice
-            out.write("S %d\n" % i)
-            note("skip %s: only %d/%d cheaper tests fail" % (maps.ids[i].rsplit("::", 1)[1], failed, ran))
-            continue
+        if run_cost >= SKIP_HUGE_COST and not is_reader:
+            # The longest tests (TPC-DS execution, the node-limit parse) exercise broad,
+            # common paths: they fail when the change breaks many of the cheaper tests on
+            # the same lines, and pass when it only bites a few narrow ones.
+            # (tests selected unrun are assumed to fail at the rate seen so far)
+            failed_est = failed + frac * len(taken)
+            if failed_est >= 12 or (failed >= 3 and frac >= 0.5):
+                out.write("I %d\n" % i)
+                selected.add(i)
+                note("select %s unrun: %d/%d cheaper tests fail" % (maps.ids[i].rsplit("::", 1)[1], failed, ran))
+                continue
+            if ran >= GIANT_MIN_EVIDENCE and frac < 0.5 and failed_est <= 9:
+                out.write("S %d\n" % i)
+                note("skip %s: only %d/%d cheaper tests fail" % (maps.ids[i].rsplit("::", 1)[1], failed, ran))
+                continue
         # Some tests fail. Checking this one costs run_cost (less if it fails early);
         # selecting it unrun costs inc_cost if it would in fact have passed.
         inc_cost = (plan_cost(selected | {i}) - plan_cost(selected)) / 1000.0
@@ -2342,7 +2426,7 @@ def schedule(durations):
     return [w for w in best[1] if w]
 
 
-def main():
+def run():
     tests = json.load(open(os.path.join(DATA, "tests.json")))["tests"]
     ms = {t["number"]: round(t["seconds"] * 1000) for t in tests}
     maps = Maps(tests)
@@ -2362,6 +2446,7 @@ def main():
         # the final has about 1.5x the commits and 4.5 minutes instead of 3
         WALL_BUDGET = 225.0
     plans = []
+    STATE.update(plans=plans, maps=maps, ms=ms, cids=cids)
     for cid in cids:
         try:
             with open(os.path.join(cdir, cid + ".patch"), encoding="utf-8", errors="surrogateescape", newline="") as fh:
@@ -2374,6 +2459,10 @@ def main():
         if FULL and plan.include != maps.all:
             # ground-truth mode: run (nearly) everything from a fresh import
             plan.cand = maps.known & ~plan.include
+            if os.environ.get("BR_ONLY"):
+                for i in range(maps.n):
+                    if os.environ["BR_ONLY"] not in maps.ids[i]:
+                        plan.cand &= ~(1 << i)
             if os.environ.get("BR_NOGIANT") == "1":
                 for i in range(maps.n):
                     if secs[i] >= GIANT_SECS:
@@ -2446,6 +2535,7 @@ def main():
     # cheapest first, so if time runs out the fallbacks hit few commits
     pending.sort(key=lambda p: (p.fresh, sum(secs[i] for i in bits(p.cand))))
     running = []
+    STATE["running"] = running
     solo = []  # plans to run with no other child alongside
     wasted = {}
     alone = False
@@ -2573,7 +2663,7 @@ def main():
                 kill_job(job)
             elif not eof:
                 cur = job.current
-                limit = (max(10.0, 20.0 * secs[cur] + 5.0) if cur is not None else 150.0) + 10.0
+                limit = (max(10.0, 20.0 * secs[cur] + 5.0) if cur is not None else 45.0) + 10.0
                 if now - job.last_progress > limit:
                     hung = True
                     kill_job(job)
@@ -2607,6 +2697,14 @@ def main():
                 running.remove(job)
                 finish(job)
 
+    emit(plans, maps, ms)
+    log("wall %.1fs, parent cpu %.2fs" % (time.time() - T0, time.process_time()))
+
+
+STATE = {"emitted": False}
+
+
+def emit(plans, maps, ms):
     out = []
     for plan in plans:
         sel = (plan.fails | plan.include) & maps.known
@@ -2620,7 +2718,48 @@ def main():
         out.append(json.dumps({"commit": plan.cid, "workers": workers}, separators=(",", ":")))
     sys.stdout.write("\n".join(out) + ("\n" if out else ""))
     sys.stdout.flush()
-    log("wall %.1fs, parent cpu %.2fs" % (time.time() - T0, time.process_time()))
+    STATE["emitted"] = True
+
+
+def emergency(err):
+    """Something went wrong in the parent: still print a valid, safe answer."""
+    log("FATAL: %r -- falling back to safe selections" % (err,))
+    for job in STATE.get("running") or ():
+        try:
+            kill_job(job)
+        except Exception:
+            pass
+    plans, maps, ms = STATE.get("plans"), STATE.get("maps"), STATE.get("ms")
+    cids = STATE.get("cids")
+    try:
+        if plans is not None and maps is not None and ms is not None and cids is not None and len(plans) == len(cids):
+            for plan in plans:
+                if not plan.done and (plan.cand or plan.fresh):
+                    plan.include = maps.known  # never finished: select everything
+            emit(plans, maps, ms)
+            return
+    except Exception as e:
+        log("FATAL in fallback: %r" % (e,))
+    tests = json.load(open(os.path.join(DATA, "tests.json")))["tests"]
+    dur = {t["number"]: round(t["seconds"] * 1000) for t in tests}
+    workers = schedule(dur)
+    cdir = os.path.join(DATA, "commits")
+    out = []
+    for f in sorted(os.listdir(cdir)):
+        if f.endswith(".patch"):
+            out.append(json.dumps({"commit": f[:-6], "workers": workers}, separators=(",", ":")))
+    sys.stdout.write("\n".join(out) + ("\n" if out else ""))
+    sys.stdout.flush()
+    STATE["emitted"] = True
+
+
+def main():
+    try:
+        run()
+    except BaseException as e:  # noqa: B902 - a crash must not cost the whole submission
+        if STATE["emitted"]:
+            raise
+        emergency(e)
 
 
 if __name__ == "__main__":
