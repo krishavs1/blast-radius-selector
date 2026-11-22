@@ -51,6 +51,16 @@ for _i, _t in enumerate(tests):
     # the first test of a class was charged the class set-up: use its recorded time
     if cpu[_i] is not None and cpu[_i] > 10 * _rec[_t] + 0.3:
         cpu[_i] = _rec[_t]
+# ---- lazily loaded modules per test (tools/loadgen.py), if recorded
+loads = {}
+for f in sorted(glob.glob(rawdir + "/loads*.json")):
+    part = json.load(open(f))
+    part.pop("__base__", None)
+    for tid, mods in part.items():
+        if tid in idx:
+            for mname in mods:
+                loads[mname] = loads.get(mname, 0) | (1 << idx[tid])
+
 data = {
     "tests": tests,
     "lines": lines,
@@ -59,6 +69,7 @@ data = {
     "imports": imports,
     "implines": {f: sorted(s) for f, s in implines.items()},
     "cpu": cpu,
+    "loads": loads,
     "deps": json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "deps.json"))),
 }
 blob = zlib.compress(pickle.dumps(data, protocol=5), 9)

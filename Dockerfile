@@ -6,7 +6,7 @@ COPY fetch_sqlglot.py /app/fetch_sqlglot.py
 RUN python /app/fetch_sqlglot.py \
  && python -m compileall -q /opt/sqlglot/sqlglot /opt/sqlglot/tests \
  && chmod -R a+rX /opt/sqlglot
-COPY selector.py fakepool.py *.bin /app/
+COPY run.py selector.py fakepool.py *.bin /app/
 RUN python -m compileall -q /app && chmod -R a+rX /app
 ENV PYTHONDONTWRITEBYTECODE=1
-CMD ["python", "/app/selector.py"]
+CMD ["python", "/app/run.py"]

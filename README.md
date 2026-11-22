@@ -24,7 +24,8 @@ For each patch (`selector.py`):
    - which repository files (fixtures, sources) each test reads;
    - for tests that farm work out to a process pool (optimizer fixtures,
      TPC-H/TPC-DS execution), the coverage of every unit of work separately;
-   - which modules each sqlglot module's import depends on.
+   - which modules each sqlglot module's import depends on, and which lazily
+     loaded modules each test pulls in.
 
    A changed instruction inside a function selects the tests that execute it.
    A changed fixture selects the tests that read it.
@@ -63,19 +64,20 @@ measured on this patch:
   commit.
 
 Anything the analysis cannot handle (unparsable patch, hunks that do not
-apply, binary files, a module that stops importing) falls back to selecting
-more tests, never fewer. A watchdog keeps the children inside the memory and
-time limits.
+apply, binary files) falls back to selecting more tests, never fewer. When a
+module stops importing, the tests that load it are run against the broken
+tree. A watchdog keeps the children inside the memory and time limits, and if
+the selector itself ever fails it still prints a valid, conservative answer.
 
 ## Layout
 
 | | |
 | --- | --- |
 | `Dockerfile` | labeled base image, the locked packages, sqlglot at the pinned commit |
-| `selector.py` | everything that runs at scoring time |
+| `run.py`, `selector.py` | everything that runs at scoring time |
 | `fakepool.py` | in-process stand-in for `ProcessPoolExecutor` |
 | `maps.bin`, `units.bin`, `instr.bin` | maps recorded on the pinned commit |
-| `tools/mapgen.py`, `tools/depgen.py`, `tools/compact.py` | how the maps were built |
+| `tools/mapgen.py`, `tools/depgen.py`, `tools/loadgen.py`, `tools/compact.py` | how the maps were built |
 | `tools/cpu.json`, `tools/deps.json` | measured per-test CPU, recorded import dependencies |
 | `fetch_sqlglot.py` | build step: download sqlglot at the pinned commit |
 
@@ -84,6 +86,7 @@ time limits.
 ```sh
 # inside the image (sqlglot at /opt/sqlglot), with tests.json from the kit
 for i in 0 1 2 3 4 5 6 7; do python tools/mapgen.py /opt/sqlglot tests.json raw/s$i.pickle $i 8 & done; wait
+for i in 0 1 2 3 4 5 6 7; do python tools/loadgen.py /opt/sqlglot tests.json raw/loads$i.json $i 8 & done; wait
 python tools/depgen.py /opt/sqlglot tools/deps.json
 python tools/compact.py raw tests.json maps.bin units.bin instr.bin
 ```

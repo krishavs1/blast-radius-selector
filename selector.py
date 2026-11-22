@@ -35,6 +35,7 @@ DEBUG = os.environ.get("BR_DEBUG") == "1"
 GC_THRESHOLD = int(os.environ.get("BR_GC", "100000"))
 MEM_FRACTION = float(os.environ.get("BR_MEM", "0.72"))
 PURGE_ALL = os.environ.get("BR_PURGE_ALL") == "1"
+USE_LOADS = os.environ.get("BR_NO_LOADS") != "1"
 PROBE = os.environ.get("BR_NO_PROBE") != "1"
 PROBE_MIN_EVALS = int(os.environ.get("BR_PROBE_EVALS", "200"))
 PROBE_MIN_TESTS = int(os.environ.get("BR_PROBE_TESTS", "10"))
@@ -234,6 +235,8 @@ class Maps:
         self.imports = d["imports"]
         self.implines = {f: set(v) for f, v in d["implines"].items()}
         self.cpu = d.get("cpu") or []
+        # test -> sqlglot modules it causes to be loaded lazily (tools/loadgen.py)
+        self.loads = d.get("loads") or {}
         # import-time dependencies between sqlglot modules (tools/depgen.py)
         self.deps = {k: set(v) for k, v in (d.get("deps") or {}).items()}
         self.n = len(self.ids)
@@ -1910,19 +1913,42 @@ def child_main(maps, plan, root, wfd, secs, forced):
         if failed == ["sqlglot"]:
             # nothing that imports sqlglot can pass
             note("sqlglot does not import")
-            preset_fail = maps.imports.get("sqlglot", 0) & maps.known
-            cand = maps.known & ~preset_fail
+            # the package itself is broken: nothing that touches it can pass, and what
+            # is left over after a failed package import is not a state worth testing in
+            preset_fail = maps.known
+            cand = 0
         elif failed:
-            # Some module no longer imports. Which tests end up asking for it depends on
-            # what a real run loads lazily and in which process; the maps cannot settle
-            # that reliably, so every test is selected.
+            # Some lazily loaded module no longer imports: the tests that ask for it fail.
             note("modules fail to import: %s" % ",".join(failed[:8]))
-            for i in bits(maps.known):
-                out.write("I %d\n" % i)
-            out.write("Q \n")
-            out.write("E 0\n")
-            out.flush()
-            return
+            if only is not None:
+                # start over from a clean slate, so that nothing registered by the
+                # modules' earlier, working versions is left behind
+                only = None
+                purge(("sqlglot", "tests"))
+                signal.setitimer(signal.ITIMER_REAL, 20)
+                ok, failed = import_all_sqlglot(Zygote.modules)
+                signal.setitimer(signal.ITIMER_REAL, 0)
+            if failed == ["sqlglot"]:
+                note("sqlglot does not import")
+                # the package itself is broken: nothing that touches it can pass, and what
+                # is left over after a failed package import is not a state worth testing in
+                preset_fail = maps.known
+                cand = 0
+            elif failed and maps.loads and USE_LOADS:
+                # run the tests that load one of them in a real (lazy) run, plus whatever
+                # touches them when everything is loaded
+                for m in failed:
+                    cand |= maps.loads.get(m, 0)
+                    cand |= maps.module_touch(m.replace(".", "/") + ".py")
+                    cand |= maps.module_touch(m.replace(".", "/") + "/__init__.py")
+                note("%d tests load them" % cand.bit_count())
+            else:
+                for i in bits(maps.known):
+                    out.write("I %d\n" % i)
+                out.write("Q \n")
+                out.write("E 0\n")
+                out.flush()
+                return
         elif forced is None and not FULL:
             notes = []
             cur = fingerprint(only)
