@@ -2260,14 +2260,22 @@ def child_main(maps, plan, root, wfd, secs, forced):
 
     def cheaper_to_select(left):
         """Is running `left` dearer than simply selecting all of it?"""
-        if len(left) < 30:
-            return False
         run = sum(secs[i] for i in left)
-        if run < 4.0:
-            return False
         sel = set(failed_idx) | taken
+        if evidence_needed:
+            # the expensive tests are decided from how these fare: keep running them
+            # unless the set is broad
+            if len(left) < 30 or run < 4.0:
+                return False
+            extra = (plan_cost(sel | set(left)) - plan_cost(sel)) / 1000.0
+            return run > 1.25 * extra
+        if run < RUN_MIN:
+            return False
         extra = (plan_cost(sel | set(left)) - plan_cost(sel)) / 1000.0
-        return run > 1.25 * extra
+        return run * CPU_FACTOR > extra
+
+    # expensive tests that may be skipped on the evidence of the cheaper ones
+    evidence_needed = any(secs[i] >= SKIP_MIN_COST and not ((plan.readers >> i) & 1 or plan.test_code) for i in giants)
 
     # Quick tests first. A spread-out sample of them goes before everything else so
     # that a change that breaks (or spares) nearly everything shows early.
@@ -2334,6 +2342,13 @@ def child_main(maps, plan, root, wfd, secs, forced):
                 out.write("S %d\n" % i)
                 note("skip %s: %d cheaper tests all pass" % (maps.ids[i].rsplit("::", 1)[1], ran))
                 continue
+            inc_cost = (plan_cost(selected | {i}) - plan_cost(selected)) / 1000.0
+            if run_cost * CPU_FACTOR >= inc_cost:
+                # checking it would cost more CPU than selecting it adds
+                out.write("I %d\n" % i)
+                selected.add(i)
+                note("select %s unrun: +%.1fs vs %.1fs to check" % (maps.ids[i].rsplit("::", 1)[1], inc_cost, run_cost))
+                continue
             before = len(failed_idx)
             run_list([i])
             selected.update(failed_idx[before:])
@@ -2376,6 +2391,8 @@ def child_main(maps, plan, root, wfd, secs, forced):
     out.flush()
 
 
+CPU_FACTOR = float(os.environ.get("BR_CPU_FACTOR", "1.5"))  # CPU seconds a test really costs per estimated second
+RUN_MIN = float(os.environ.get("BR_RUN_MIN", "1.0"))
 GIANT_MIN_EVIDENCE = int(os.environ.get("BR_GIANT_MIN", "10"))
 GIANT_INCLUDE_FRAC = float(os.environ.get("BR_GIANT_FRAC", "0.5"))
 SKIP_MIN_COST = float(os.environ.get("BR_SKIP_MIN", "4.0"))
