@@ -954,6 +954,8 @@ def analyze(maps, cid, text):
             plan.overlay[rel] = new_text
             plan.notes.append("%s: new file" % rel)
             base = os.path.basename(rel)
+            if base in ("conftest.py", "pytest.ini", "tox.ini"):
+                plan.include |= maps.all
             if os.path.exists(os.path.join(PRISTINE, rel)) or base in ("conftest.py", "__init__.py", "sitecustomize.py"):
                 plan.cand |= maps.all
             elif in_tree:
@@ -994,6 +996,13 @@ def analyze(maps, cid, text):
             b = maps.opens.get(rel, 0)
             if top == "sqlglotc":
                 b |= maps.file_bits.get("tests/test_sqlglotc.py", 0)
+            base = os.path.basename(rel)
+            touched = "\n".join(t for h in fc.hunks for tag, t in h[4] if tag in "+-")
+            if base in ("pytest.ini", "tox.ini", "conftest.py") or (
+                base in ("pyproject.toml", "setup.cfg") and "pytest" in touched.lower()
+            ):
+                # how the test run itself is configured: cannot be reproduced here
+                b = maps.all
             plan.notes.append("%s: outside tree -> include %d" % (rel, b.bit_count()))
             plan.include |= b
             continue
@@ -1006,6 +1015,17 @@ def analyze(maps, cid, text):
             ch = py_change(maps, rel, old_text, new_text)
             plan.notes.append("%s: %s" % (rel, "; ".join(ch.notes)))
             plan.cand |= ch.cand
+            if top == "tests" and (ch.broken or os.path.basename(rel) in ("conftest.py", "__init__.py")):
+                # every test that imports this module is affected (and they are run)
+                plan.cand |= maps.file_any(rel) | maps.file_bits.get(rel, 0)
+                if os.path.basename(rel) in ("conftest.py", "__init__.py"):
+                    if os.path.basename(rel) == "conftest.py":
+                        plan.include |= maps.all
+                    else:
+                        d = os.path.dirname(rel) + "/"
+                        for f, fb in maps.file_bits.items():
+                            if f.startswith(d):
+                                plan.cand |= fb
             plan.readers |= maps.opens.get(rel, 0)
             if top == "sqlglot":
                 if ch.read:
